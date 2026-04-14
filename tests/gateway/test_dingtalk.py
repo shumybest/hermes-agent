@@ -262,6 +262,46 @@ class TestConnect:
         assert len(adapter._seen_messages) == 0
         assert adapter._http_client is None
 
+    @pytest.mark.asyncio
+    async def test_run_stream_supports_async_sdk_start(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        class AsyncStreamClient:
+            def __init__(self):
+                self.called = 0
+
+            async def start(self):
+                self.called += 1
+                adapter._running = False
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._stream_client = AsyncStreamClient()
+        adapter._running = True
+
+        await adapter._run_stream()
+
+        assert adapter._stream_client.called == 1
+
+    @pytest.mark.asyncio
+    async def test_run_stream_supports_sync_sdk_start(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        class SyncStreamClient:
+            def __init__(self):
+                self.called = 0
+
+            def start(self):
+                self.called += 1
+                adapter._running = False
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._stream_client = SyncStreamClient()
+        adapter._running = True
+
+        await adapter._run_stream()
+
+        assert adapter._stream_client.called == 1
+
 
 # ---------------------------------------------------------------------------
 # Platform enum
