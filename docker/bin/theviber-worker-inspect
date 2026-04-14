@@ -1,0 +1,169 @@
+#!/bin/sh
+set -eu
+
+command_name="$(basename "$0")"
+
+redaction_jq_filter='
+  def sensitive_key:
+    ascii_downcase
+    | test("(^|_|-)(secret|token|password|api_key|encrypt_key|encoding_aes_key|client_secret|app_secret)(_|-|$)");
+  def redact:
+    walk(
+      if type == "object" then
+        with_entries(
+          if (.key | sensitive_key) and (.value | type == "string") then
+            .value = "***REDACTED***"
+          else
+            .
+          end
+        )
+      else
+        .
+      end
+    );
+  redact
+'
+
+print_redacted_json_file() {
+  file_path="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq "$redaction_jq_filter" "$file_path"
+  else
+    sed \
+      -e 's/\("api_key"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("app_secret"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("client_secret"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("secret"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("token"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("encrypt_key"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      -e 's/\("encoding_aes_key"[[:space:]]*:[[:space:]]*\)"[^"]*"/\1"***REDACTED***"/g' \
+      "$file_path"
+  fi
+}
+
+print_redacted_env_file() {
+  file_path="$1"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ""|\#*)
+        printf '%s\n' "$line"
+        ;;
+      *=*)
+        key=${line%%=*}
+        upper_key=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')
+        case "$upper_key" in
+          *SECRET*|*TOKEN*|*PASSWORD*|*API_KEY*|*ENCRYPT_KEY*|*ENCODING_AES_KEY*)
+            printf '%s=%s\n' "$key" "***REDACTED***"
+            ;;
+          *)
+            printf '%s\n' "$line"
+            ;;
+        esac
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < "$file_path"
+}
+
+print_hermes_model() {
+  echo "HERMES_HOME=${HERMES_HOME:-}"
+  echo "--- Hermes model ---"
+  print_redacted_json_file "$HERMES_HOME/config.yaml" | (command -v jq >/dev/null 2>&1 && jq '.model // {}' || cat)
+  if [ -f "$HERMES_HOME/.env" ]; then
+    echo
+    echo "--- Hermes model env ---"
+    print_redacted_env_file "$HERMES_HOME/.env" | grep -E '^(OPENAI_BASE_URL|LLM_GATEWAY_URL|LLM_GATEWAY_APP_ID_HEADER|LLM_GATEWAY_APP_ID|LLM_GATEWAY_INSTANCE_ID_HEADER|LLM_GATEWAY_INSTANCE_ID|LLM_MODEL)=' || true
+  fi
+}
+
+print_hermes_channels() {
+  echo "HERMES_HOME=${HERMES_HOME:-}"
+  echo "--- Hermes platforms ---"
+  print_redacted_json_file "$HERMES_HOME/config.yaml" | (command -v jq >/dev/null 2>&1 && jq '.platforms // {}' || cat)
+  if [ -f "$HERMES_HOME/.env" ]; then
+    echo
+    echo "--- Hermes channel env ---"
+    print_redacted_env_file "$HERMES_HOME/.env" | grep -E '^(FEISHU_|DINGTALK_|WECOM_)' || true
+  fi
+}
+
+print_hermes_config() {
+  echo "HERMES_HOME=${HERMES_HOME:-}"
+  echo "--- config.yaml ---"
+  print_redacted_json_file "$HERMES_HOME/config.yaml" | sed -n '1,160p'
+  if [ -f "$HERMES_HOME/.env" ]; then
+    echo
+    echo "--- .env ---"
+    print_redacted_env_file "$HERMES_HOME/.env" | sed -n '1,160p'
+  fi
+  if [ -e /opt/hermes/runtime-config.yaml ] || [ -L /opt/hermes/runtime-config.yaml ]; then
+    echo
+    echo "--- aliases under /opt/hermes ---"
+    ls -la /opt/hermes/runtime-state /opt/hermes/runtime-config.yaml /opt/hermes/runtime.env 2>/dev/null || true
+  fi
+}
+
+print_openclaw_model() {
+  echo "OPENCLAW_CONFIG_PATH=${OPENCLAW_CONFIG_PATH:-}"
+  echo "--- OpenClaw provider config ---"
+  if command -v jq >/dev/null 2>&1; then
+    print_redacted_json_file "$OPENCLAW_CONFIG_PATH" | jq '{provider: .provider, providers: .providers, models: .models}'
+  else
+    print_redacted_json_file "$OPENCLAW_CONFIG_PATH" | sed -n '1,120p'
+  fi
+}
+
+print_openclaw_channels() {
+  echo "OPENCLAW_CONFIG_PATH=${OPENCLAW_CONFIG_PATH:-}"
+  echo "--- OpenClaw channels ---"
+  if command -v jq >/dev/null 2>&1; then
+    print_redacted_json_file "$OPENCLAW_CONFIG_PATH" | jq '.channels // {}'
+  else
+    print_redacted_json_file "$OPENCLAW_CONFIG_PATH" | sed -n '1,160p'
+  fi
+}
+
+print_openclaw_config() {
+  echo "OPENCLAW_CONFIG_PATH=${OPENCLAW_CONFIG_PATH:-}"
+  echo "--- openclaw.json ---"
+  print_redacted_json_file "$OPENCLAW_CONFIG_PATH" | sed -n '1,160p'
+}
+
+if [ -n "${HERMES_HOME:-}" ] && [ -f "${HERMES_HOME}/config.yaml" ]; then
+  case "$command_name" in
+    model)
+      print_hermes_model
+      exit 0
+      ;;
+    channels)
+      print_hermes_channels
+      exit 0
+      ;;
+    config)
+      print_hermes_config
+      exit 0
+      ;;
+  esac
+fi
+
+if [ -n "${OPENCLAW_CONFIG_PATH:-}" ] && [ -f "${OPENCLAW_CONFIG_PATH}" ]; then
+  case "$command_name" in
+    model)
+      print_openclaw_model
+      exit 0
+      ;;
+    channels)
+      print_openclaw_channels
+      exit 0
+      ;;
+    config)
+      print_openclaw_config
+      exit 0
+      ;;
+  esac
+fi
+
+echo "No managed runtime config detected."
+exit 1

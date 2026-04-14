@@ -169,7 +169,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id",
 }
 
 
@@ -307,6 +307,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
+        # Live runs that can be interrupted explicitly by the platform facade.
+        self._active_runs: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -980,6 +982,90 @@ class APIServerAdapter(BasePlatformAdapter):
             "deleted": True,
         })
 
+    async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/messages — fetch persisted session history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = (request.match_info.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response(_openai_error("Session ID is required", code="session_id_required"), status=400)
+
+        try:
+            limit = int((request.query.get("limit") or "200").strip())
+        except ValueError:
+            return web.json_response(_openai_error("Invalid session history limit", code="invalid_limit"), status=400)
+
+        limit = max(1, min(limit, 500))
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+
+        try:
+            messages = db.get_messages(session_id) or []
+        except Exception as e:
+            logger.warning("Failed to load raw session history for %s: %s", session_id, e)
+            return web.json_response(_openai_error("Failed to load session history", code="session_history_failed"), status=500)
+
+        total = len(messages)
+        if total == 0:
+            return web.json_response(
+                {
+                    "session_id": session_id,
+                    "limit": limit,
+                    "count": 0,
+                    "total": 0,
+                    "truncated": False,
+                    "messages": [],
+                }
+            )
+
+        truncated = total > limit
+        selected = messages[-limit:] if truncated else messages
+        payload_messages: List[Dict[str, Any]] = []
+        for msg in selected:
+            if not isinstance(msg, dict):
+                continue
+            item: Dict[str, Any] = {
+                "id": msg.get("id"),
+                "role": msg.get("role"),
+                "content": msg.get("content"),
+                "timestamp": msg.get("timestamp"),
+            }
+            if msg.get("tool_call_id"):
+                item["tool_call_id"] = msg.get("tool_call_id")
+            if msg.get("tool_name"):
+                item["tool_name"] = msg.get("tool_name")
+            if msg.get("tool_calls"):
+                item["tool_calls"] = msg.get("tool_calls")
+            if msg.get("finish_reason"):
+                item["finish_reason"] = msg.get("finish_reason")
+            if msg.get("reasoning"):
+                item["reasoning"] = msg.get("reasoning")
+            if msg.get("reasoning_details"):
+                try:
+                    item["reasoning_details"] = json.loads(msg.get("reasoning_details"))
+                except Exception:
+                    item["reasoning_details"] = msg.get("reasoning_details")
+            if msg.get("codex_reasoning_items"):
+                try:
+                    item["codex_reasoning_items"] = json.loads(msg.get("codex_reasoning_items"))
+                except Exception:
+                    item["codex_reasoning_items"] = msg.get("codex_reasoning_items")
+            payload_messages.append(item)
+
+        return web.json_response(
+            {
+                "session_id": session_id,
+                "limit": limit,
+                "count": len(payload_messages),
+                "total": total,
+                "truncated": truncated,
+                "messages": payload_messages,
+            }
+        )
+
     # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
@@ -1402,7 +1488,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        requested_run_id = str(body.get("run_id") or "").strip()
+        run_id = requested_run_id or f"run_{uuid.uuid4().hex}"
+        if run_id in self._run_streams or run_id in self._active_runs:
+            return web.json_response(
+                _openai_error(f"Run already exists: {run_id}", code="run_id_conflict"),
+                status=409,
+            )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         self._run_streams[run_id] = q
@@ -1473,6 +1565,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
 
         async def _run_and_close():
+            current_task = asyncio.current_task()
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -1480,6 +1573,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
+                self._active_runs[run_id] = {
+                    "agent": agent,
+                    "task": current_task,
+                    "session_id": session_id,
+                    "created_at": time.time(),
+                }
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
@@ -1498,6 +1597,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
+                    "session_id": session_id,
                     "output": final_response,
                     "usage": usage,
                 })
@@ -1508,11 +1608,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
+                        "session_id": session_id,
                         "error": str(exc),
                     })
                 except Exception:
                     pass
             finally:
+                self._active_runs.pop(run_id, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1528,6 +1630,71 @@ class APIServerAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+
+    async def _handle_abort_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}:abort — request cooperative interruption of a live run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = (request.match_info.get("run_id") or "").strip()
+        if not run_id:
+            return web.json_response(_openai_error("Run ID is required", code="run_id_required"), status=400)
+
+        run_state = self._active_runs.get(run_id)
+        if not run_state:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        reason = "Abort requested via API"
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if isinstance(body, dict):
+            custom_reason = str(body.get("reason") or "").strip()
+            if custom_reason:
+                reason = custom_reason
+
+        agent = run_state.get("agent")
+        if agent is None:
+            return web.json_response(
+                _openai_error(f"Run is not ready to abort: {run_id}", code="run_not_abortable"),
+                status=409,
+            )
+
+        try:
+            agent.interrupt(reason)
+        except Exception as e:
+            logger.warning("[api_server] failed to interrupt run %s: %s", run_id, e)
+            return web.json_response(
+                _openai_error(f"Failed to abort run: {run_id}", code="run_abort_failed"),
+                status=500,
+            )
+
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait(
+                    {
+                        "event": "run.abort_requested",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "session_id": run_state.get("session_id"),
+                        "reason": reason,
+                    }
+                )
+            except Exception:
+                pass
+
+        return web.json_response(
+            {
+                "run_id": run_id,
+                "status": "abort_requested",
+                "session_id": run_state.get("session_id"),
+                "accepted_at": int(time.time()),
+            },
+            status=202,
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -1614,6 +1781,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_get("/v1/sessions/{session_id}/messages", self._handle_session_messages)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -1626,6 +1794,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}:abort", self._handle_abort_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

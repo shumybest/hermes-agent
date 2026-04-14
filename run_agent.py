@@ -792,6 +792,14 @@ class AIAgent:
                     }
                 elif "portal.qwen.ai" in effective_base.lower():
                     client_kwargs["default_headers"] = _qwen_portal_headers()
+                from hermes_cli.runtime_provider import resolve_runtime_default_headers
+
+                merged_headers = resolve_runtime_default_headers(
+                    effective_base,
+                    client_kwargs.get("default_headers"),
+                )
+                if merged_headers:
+                    client_kwargs["default_headers"] = merged_headers
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -826,6 +834,16 @@ class AIAgent:
                             "X-OpenRouter-Categories": "productivity,cli-agent",
                         },
                     }
+                from hermes_cli.runtime_provider import resolve_runtime_default_headers
+
+                merged_headers = resolve_runtime_default_headers(
+                    str(client_kwargs.get("base_url", "")),
+                    client_kwargs.get("default_headers"),
+                )
+                if merged_headers:
+                    client_kwargs["default_headers"] = merged_headers
+                else:
+                    client_kwargs.pop("default_headers", None)
             
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -4145,18 +4163,24 @@ class AIAgent:
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import _OR_HEADERS
+        from hermes_cli.runtime_provider import resolve_runtime_default_headers
 
         normalized = (base_url or "").lower()
+        headers = None
         if "openrouter" in normalized:
-            self._client_kwargs["default_headers"] = dict(_OR_HEADERS)
+            headers = dict(_OR_HEADERS)
         elif "api.githubcopilot.com" in normalized:
             from hermes_cli.models import copilot_default_headers
 
-            self._client_kwargs["default_headers"] = copilot_default_headers()
+            headers = copilot_default_headers()
         elif "api.kimi.com" in normalized:
-            self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
+            headers = {"User-Agent": "KimiCLI/1.3"}
         elif "portal.qwen.ai" in normalized:
-            self._client_kwargs["default_headers"] = _qwen_portal_headers()
+            headers = _qwen_portal_headers()
+
+        merged_headers = resolve_runtime_default_headers(base_url, headers)
+        if merged_headers:
+            self._client_kwargs["default_headers"] = merged_headers
         else:
             self._client_kwargs.pop("default_headers", None)
 

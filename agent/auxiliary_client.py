@@ -895,7 +895,14 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
         return None, None
     model = _read_main_model() or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s)", model)
-    return OpenAI(api_key=custom_key, base_url=custom_base), model
+    from hermes_cli.runtime_provider import resolve_runtime_default_headers
+
+    headers = resolve_runtime_default_headers(custom_base)
+    return OpenAI(
+        api_key=custom_key,
+        base_url=custom_base,
+        **({"default_headers": headers} if headers else {}),
+    ), model
 
 
 def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
@@ -1289,7 +1296,14 @@ def resolve_provider_client(
                 )
                 return None, None
             final_model = model or _read_main_model() or "gpt-4o-mini"
-            client = OpenAI(api_key=custom_key, base_url=custom_base)
+            from hermes_cli.runtime_provider import resolve_runtime_default_headers
+
+            headers = resolve_runtime_default_headers(custom_base)
+            client = OpenAI(
+                api_key=custom_key,
+                base_url=custom_base,
+                **({"default_headers": headers} if headers else {}),
+            )
             return (_to_async_client(client, final_model) if async_mode
                     else (client, final_model))
         # Try custom first, then codex, then API-key providers
@@ -1313,7 +1327,14 @@ def resolve_provider_client(
             custom_key = custom_entry.get("api_key", "").strip() or "no-key-required"
             if custom_base:
                 final_model = model or _read_main_model() or "gpt-4o-mini"
-                client = OpenAI(api_key=custom_key, base_url=custom_base)
+                from hermes_cli.runtime_provider import resolve_runtime_default_headers
+
+                headers = resolve_runtime_default_headers(custom_base)
+                client = OpenAI(
+                    api_key=custom_key,
+                    base_url=custom_base,
+                    **({"default_headers": headers} if headers else {}),
+                )
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s)",
                     provider, final_model)

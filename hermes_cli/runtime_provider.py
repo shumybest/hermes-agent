@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import json
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,71 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if "api.openai.com" in normalized and "openrouter" not in normalized:
         return "codex_responses"
     return None
+
+
+def resolve_runtime_default_headers(
+    base_url: str,
+    existing_headers: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Resolve default headers for OpenAI-compatible runtime clients.
+
+    Custom endpoint users sometimes need extra scoping headers in addition to
+    Authorization. Keep this logic centralized so the CLI, gateway, and
+    auxiliary clients stay aligned.
+    """
+    merged: Dict[str, str] = {}
+    if isinstance(existing_headers, dict):
+        for key, value in existing_headers.items():
+            normalized_key = str(key or "").strip()
+            normalized_value = str(value or "").strip()
+            if normalized_key and normalized_value:
+                merged[normalized_key] = normalized_value
+
+    raw_json = (
+        os.getenv("OPENAI_DEFAULT_HEADERS_JSON", "").strip()
+        or os.getenv("OPENAI_DEFAULT_HEADERS", "").strip()
+    )
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except Exception as exc:
+            logger.warning("Ignoring invalid OPENAI_DEFAULT_HEADERS_JSON: %s", exc)
+        else:
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    normalized_key = str(key or "").strip()
+                    normalized_value = str(value or "").strip()
+                    if normalized_key and normalized_value:
+                        merged[normalized_key] = normalized_value
+
+    normalized_base_url = (base_url or "").strip().lower()
+    if not normalized_base_url or "openrouter.ai" in normalized_base_url:
+        return merged
+
+    app_id = (
+        os.getenv("LLM_GATEWAY_APP_ID", "").strip()
+        or os.getenv("THEVIBER_PROJECT_ID", "").strip()
+    )
+    app_id_header = (
+        os.getenv("LLM_GATEWAY_APP_ID_HEADER", "").strip()
+        or ("X-Theviber-Project-Id" if app_id else "")
+    )
+    if app_id_header and app_id:
+        merged.setdefault(app_id_header, app_id)
+
+    instance_id = (
+        os.getenv("LLM_GATEWAY_INSTANCE_ID", "").strip()
+        or os.getenv("THEVIBER_WORKER_INSTANCE_ID", "").strip()
+        or os.getenv("THEVIBER_OPENCLAW_INSTANCE_ID", "").strip()
+    )
+    instance_id_header = (
+        os.getenv("LLM_GATEWAY_INSTANCE_ID_HEADER", "").strip()
+        or ("X-Theviber-OpenClaw-Instance-Id" if instance_id else "")
+    )
+    if instance_id_header and instance_id:
+        merged.setdefault(instance_id_header, instance_id)
+
+    return merged
 
 
 def _auto_detect_local_model(base_url: str) -> str:
