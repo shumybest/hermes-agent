@@ -304,6 +304,46 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_codex_includes_runtime_default_headers_as_extra_headers(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent._client_kwargs["default_headers"] = {
+        "X-Theviber-Project-Id": "project-123",
+        "X-Theviber-OpenClaw-Instance-Id": "instance-456",
+    }
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert kwargs["extra_headers"]["X-Theviber-Project-Id"] == "project-123"
+    assert kwargs["extra_headers"]["X-Theviber-OpenClaw-Instance-Id"] == "instance-456"
+
+
+def test_build_api_kwargs_codex_merges_xai_and_runtime_extra_headers(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="grok-4-0709",
+        provider="xai",
+        api_mode="codex_responses",
+        base_url="https://api.x.ai/v1",
+        api_key="xai-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    agent._client_kwargs["default_headers"] = {
+        "X-Theviber-Project-Id": "project-123",
+    }
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert kwargs["extra_headers"]["X-Theviber-Project-Id"] == "project-123"
+    assert kwargs["extra_headers"]["x-grok-conv-id"] == agent.session_id
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 
@@ -1301,3 +1341,26 @@ def test_preflight_codex_input_deduplicates_reasoning_ids(monkeypatch):
     # IDs must be stripped — with store=False the API 404s on id lookups.
     for it in reasoning_items:
         assert "id" not in it
+
+
+def test_spinner_thinking_fallback_works_without_classmethods(monkeypatch):
+    monkeypatch.delattr(run_agent.KawaiiSpinner, "get_thinking_faces", raising=False)
+    monkeypatch.delattr(run_agent.KawaiiSpinner, "get_thinking_verbs", raising=False)
+    monkeypatch.setattr(run_agent.KawaiiSpinner, "KAWAII_THINKING", ["(fallback-face)"], raising=False)
+    monkeypatch.setattr(run_agent.KawaiiSpinner, "THINKING_VERBS", ["fallback-verb"], raising=False)
+
+    assert run_agent._spinner_thinking_faces() == ["(fallback-face)"]
+    assert run_agent._spinner_thinking_verbs() == ["fallback-verb"]
+
+
+def test_spinner_thinking_builtin_fallback_when_class_and_attrs_unusable(monkeypatch):
+    monkeypatch.delattr(run_agent.KawaiiSpinner, "get_thinking_faces", raising=False)
+    monkeypatch.delattr(run_agent.KawaiiSpinner, "get_thinking_verbs", raising=False)
+    monkeypatch.setattr(run_agent.KawaiiSpinner, "KAWAII_THINKING", [], raising=False)
+    monkeypatch.setattr(run_agent.KawaiiSpinner, "THINKING_VERBS", None, raising=False)
+
+    faces = run_agent._spinner_thinking_faces()
+    verbs = run_agent._spinner_thinking_verbs()
+
+    assert isinstance(faces, list) and len(faces) > 0
+    assert isinstance(verbs, list) and len(verbs) > 0

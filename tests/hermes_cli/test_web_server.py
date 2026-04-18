@@ -1178,3 +1178,27 @@ class TestStatusRemoteGateway:
         assert data["gateway_running"] is True
         assert data["gateway_pid"] is None
         assert data["gateway_state"] == "running"
+
+
+def test_url_without_dashboard_token_strips_bootstrap_query_param():
+    import hermes_cli.web_server as ws
+    from starlette.requests import Request
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/dashboard",
+        "raw_path": b"/dashboard",
+        "query_string": b"theviber_token=secret-token&foo=bar&foo=baz",
+        "headers": [(b"host", b"example.com")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("example.com", 80),
+    }
+    request = Request(scope)
+
+    clean_url = ws._url_without_dashboard_token(request)
+    assert "theviber_token=" not in clean_url
+    assert "foo=bar" in clean_url
+    assert "foo=baz" in clean_url

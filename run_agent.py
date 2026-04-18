@@ -110,6 +110,71 @@ from utils import atomic_json_write, env_var_enabled
 
 
 
+def _normalize_spinner_values(values: Any) -> list[str]:
+    """Normalize spinner config values to a non-empty list of strings."""
+    if isinstance(values, str):
+        candidate = values.strip()
+        return [candidate] if candidate else []
+    if not isinstance(values, (list, tuple)):
+        return []
+    normalized: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _resolve_spinner_values(
+    getter_name: str,
+    fallback_attr: str,
+    builtins: list[str],
+) -> list[str]:
+    """Return spinner values with backward-compatible fallbacks.
+
+    Some runtime base images ship an older KawaiiSpinner without newer
+    classmethods (for example get_thinking_faces/get_thinking_verbs). Keep
+    conversation execution resilient across mixed image versions.
+    """
+    getter = getattr(KawaiiSpinner, getter_name, None)
+    if callable(getter):
+        try:
+            values = _normalize_spinner_values(getter())
+            if values:
+                return values
+        except Exception:
+            pass
+
+    values = _normalize_spinner_values(getattr(KawaiiSpinner, fallback_attr, None))
+    if values:
+        return values
+    return builtins
+
+
+def _spinner_waiting_faces() -> list[str]:
+    return _resolve_spinner_values(
+        "get_waiting_faces",
+        "KAWAII_WAITING",
+        ["(｡◕‿◕｡)", "(◕‿◕✿)", "(✿◠‿◠)", "(◕ᴗ◕✿)", "(≧◡≦)"],
+    )
+
+
+def _spinner_thinking_faces() -> list[str]:
+    return _resolve_spinner_values(
+        "get_thinking_faces",
+        "KAWAII_THINKING",
+        ["(◔_◔)", "(¬‿¬)", "(´･_･`)", "(⊙_⊙)", "ಠ_ಠ"],
+    )
+
+
+def _spinner_thinking_verbs() -> list[str]:
+    return _resolve_spinner_values(
+        "get_thinking_verbs",
+        "THINKING_VERBS",
+        ["pondering", "analyzing", "reasoning", "processing", "computing"],
+    )
+
+
 class _SafeWriter:
     """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
 
@@ -2998,6 +3063,35 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Could not extract API key for debug dump: %s", e)
 
+            request_headers: Dict[str, str] = {
+                "Authorization": f"Bearer {self._mask_api_key_for_logs(api_key)}",
+                "Content-Type": "application/json",
+            }
+
+            extra_headers = api_kwargs.get("extra_headers")
+            if isinstance(extra_headers, dict):
+                for key, value in extra_headers.items():
+                    normalized_key = str(key or "").strip()
+                    if not normalized_key or value is None:
+                        continue
+                    if normalized_key.lower() == "authorization":
+                        continue
+                    request_headers[normalized_key] = str(value)
+
+            default_headers = (
+                self._client_kwargs.get("default_headers")
+                if isinstance(getattr(self, "_client_kwargs", None), dict)
+                else None
+            )
+            if isinstance(default_headers, dict):
+                for key, value in default_headers.items():
+                    normalized_key = str(key or "").strip()
+                    if not normalized_key or value is None:
+                        continue
+                    if normalized_key.lower() == "authorization":
+                        continue
+                    request_headers.setdefault(normalized_key, str(value))
+
             dump_payload: Dict[str, Any] = {
                 "timestamp": datetime.now().isoformat(),
                 "session_id": self.session_id,
@@ -3005,10 +3099,7 @@ class AIAgent:
                 "request": {
                     "method": "POST",
                     "url": f"{self.base_url.rstrip('/')}{'/responses' if self.api_mode == 'codex_responses' else '/chat/completions'}",
-                    "headers": {
-                        "Authorization": f"Bearer {self._mask_api_key_for_logs(api_key)}",
-                        "Content-Type": "application/json",
-                    },
+                    "headers": request_headers,
                     "body": body,
                 },
             }
@@ -4387,7 +4478,49 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-        from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
+        try:
+            from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
+        except ImportError:
+            # Backward compatibility: some runtime base images still ship an older
+            # auxiliary_client module that does not export these validators.
+            from urllib.parse import urlparse
+
+            def _validate_proxy_env_urls() -> None:
+                for key in (
+                    "HTTPS_PROXY",
+                    "HTTP_PROXY",
+                    "ALL_PROXY",
+                    "https_proxy",
+                    "http_proxy",
+                    "all_proxy",
+                ):
+                    value = str(os.environ.get(key) or "").strip()
+                    if not value:
+                        continue
+                    try:
+                        parsed = urlparse(value)
+                        if parsed.scheme:
+                            _ = parsed.port
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"Malformed proxy environment variable {key}={value!r}. "
+                            "Fix or unset your proxy settings and try again."
+                        ) from exc
+
+            def _validate_base_url(base_url: str) -> None:
+                candidate = str(base_url or "").strip()
+                if not candidate or candidate.startswith("acp://"):
+                    return
+                try:
+                    parsed = urlparse(candidate)
+                    if parsed.scheme in {"http", "https"}:
+                        _ = parsed.port
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Malformed custom endpoint URL: {candidate!r}. "
+                        "Run `hermes setup` or `hermes model` and enter a valid http(s) base URL."
+                    ) from exc
+
         # Treat client_kwargs as read-only. Callers pass self._client_kwargs (or shallow
         # copies of it) in; any in-place mutation leaks back into the stored dict and is
         # reused on subsequent requests. #10933 hit this by injecting an httpx.Client
@@ -6650,8 +6783,29 @@ class AIAgent:
             if self.max_tokens is not None and not is_codex_backend:
                 kwargs["max_output_tokens"] = self.max_tokens
 
+            merged_extra_headers: Dict[str, str] = {}
+            existing_extra_headers = kwargs.get("extra_headers")
+            if isinstance(existing_extra_headers, dict):
+                for key, value in existing_extra_headers.items():
+                    normalized_key = str(key or "").strip()
+                    if not normalized_key or value is None:
+                        continue
+                    merged_extra_headers[normalized_key] = str(value)
+
+            default_headers = None
+            if isinstance(getattr(self, "_client_kwargs", None), dict):
+                default_headers = self._client_kwargs.get("default_headers")
+            if isinstance(default_headers, dict):
+                for key, value in default_headers.items():
+                    normalized_key = str(key or "").strip()
+                    if not normalized_key or value is None:
+                        continue
+                    merged_extra_headers.setdefault(normalized_key, str(value))
+
             if is_xai_responses and getattr(self, "session_id", None):
-                kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
+                merged_extra_headers.setdefault("x-grok-conv-id", self.session_id)
+            if merged_extra_headers:
+                kwargs["extra_headers"] = merged_extra_headers
 
             return kwargs
 
@@ -7599,7 +7753,7 @@ class AIAgent:
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
         if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-            face = random.choice(KawaiiSpinner.get_waiting_faces())
+            face = random.choice(_spinner_waiting_faces())
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
 
@@ -7924,7 +8078,7 @@ class AIAgent:
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    face = random.choice(_spinner_waiting_faces())
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
                 self._delegate_spinner = spinner
@@ -7951,7 +8105,7 @@ class AIAgent:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
                 if self.quiet_mode and not self.tool_progress_callback:
-                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    face = random.choice(_spinner_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -7975,7 +8129,7 @@ class AIAgent:
                 # These are not in the tool registry — route through MemoryManager.
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    face = random.choice(_spinner_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -7997,7 +8151,7 @@ class AIAgent:
             elif self.quiet_mode:
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
-                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    face = random.choice(_spinner_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
@@ -8830,8 +8984,8 @@ class AIAgent:
                 self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
             else:
                 # Animated thinking spinner in quiet mode
-                face = random.choice(KawaiiSpinner.get_thinking_faces())
-                verb = random.choice(KawaiiSpinner.get_thinking_verbs())
+                face = random.choice(_spinner_thinking_faces())
+                verb = random.choice(_spinner_thinking_verbs())
                 if self.thinking_callback:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)

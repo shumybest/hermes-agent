@@ -50,7 +50,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -63,6 +63,21 @@ WEB_DIST = Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
+
+_THEVIBER_DASHBOARD_ACCESS_TOKEN = os.getenv("THEVIBER_HERMES_DASHBOARD_ACCESS_TOKEN", "").strip()
+_THEVIBER_DASHBOARD_TOKEN_QUERY_PARAM = "theviber_token"
+_THEVIBER_DASHBOARD_COOKIE_NAME = (
+    "__theviber_dashboard_"
+    + "".join(
+        ch if ch.isalnum() else "_"
+        for ch in os.getenv("THEVIBER_WORKER_INSTANCE_ID", "default").strip().lower()
+    )
+)
+_THEVIBER_ADDITIONAL_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("THEVIBER_HERMES_DASHBOARD_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -82,6 +97,7 @@ _REVEAL_WINDOW_SECONDS = 30
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=_THEVIBER_ADDITIONAL_ALLOWED_ORIGINS,
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
@@ -114,9 +130,78 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _is_local_dashboard_request(request: Request) -> bool:
+    host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    forwarded_host = forwarded_host.split(":", 1)[0].lower()
+    return host in {"127.0.0.1", "localhost", "::1"} or forwarded_host in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+
+
+def _dashboard_access_protection_enabled() -> bool:
+    return bool(_THEVIBER_DASHBOARD_ACCESS_TOKEN)
+
+
+def _request_has_valid_dashboard_token(request: Request) -> bool:
+    if not _dashboard_access_protection_enabled():
+        return True
+    if _is_local_dashboard_request(request):
+        return True
+
+    candidates = [
+        request.cookies.get(_THEVIBER_DASHBOARD_COOKIE_NAME, ""),
+        request.headers.get("x-theviber-dashboard-token", ""),
+        request.headers.get("x-theviber-token", ""),
+    ]
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        candidates.append(auth[7:].strip())
+    expected = _THEVIBER_DASHBOARD_ACCESS_TOKEN
+    return any(candidate and hmac.compare_digest(candidate.encode(), expected.encode()) for candidate in candidates)
+
+
+def _url_without_dashboard_token(request: Request) -> str:
+    path = request.url.path or "/"
+    query_items = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != _THEVIBER_DASHBOARD_TOKEN_QUERY_PARAM
+    ]
+    query = urllib.parse.urlencode(query_items, doseq=True)
+    return f"{path}?{query}" if query else path
+
+
+async def _set_dashboard_cookie_and_continue(request: Request, call_next):
+    response = await call_next(request)
+    response.set_cookie(
+        _THEVIBER_DASHBOARD_COOKIE_NAME,
+        _THEVIBER_DASHBOARD_ACCESS_TOKEN,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require dashboard access bootstrap token and API session token."""
+    if _dashboard_access_protection_enabled() and not _request_has_valid_dashboard_token(request):
+        bootstrap_token = request.query_params.get(_THEVIBER_DASHBOARD_TOKEN_QUERY_PARAM, "")
+        expected = _THEVIBER_DASHBOARD_ACCESS_TOKEN
+        if bootstrap_token and hmac.compare_digest(bootstrap_token.encode(), expected.encode()):
+            # Do not issue an HTTP redirect here: reverse proxies may strip path
+            # prefixes and produce invalid Location headers for external clients.
+            return await _set_dashboard_cookie_and_continue(request, call_next)
+        if request.url.path.startswith("/api/"):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+            )
+        return HTMLResponse("Unauthorized", status_code=401)
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
         auth = request.headers.get("authorization", "")
@@ -2051,13 +2136,52 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
+    def _rewrite_dashboard_asset_urls(html: str) -> str:
+        """Rewrite root-absolute asset URLs so proxy subpaths can resolve them."""
+        rewritten = html
+        for old, new in (
+            ('src="/assets/', 'src="assets/'),
+            ("src='/assets/", "src='assets/"),
+            ('href="/assets/', 'href="assets/'),
+            ("href='/assets/", "href='assets/"),
+            ('href="/favicon', 'href="favicon'),
+            ("href='/favicon", "href='favicon"),
+        ):
+            rewritten = rewritten.replace(old, new)
+        return rewritten
+
     def _serve_index():
         """Return index.html with the session token injected."""
-        html = _index_path.read_text()
+        html = _index_path.read_text(encoding="utf-8")
+        html = _rewrite_dashboard_asset_urls(html)
         token_script = (
-            f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";</script>'
+            "<script>"
+            f'window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+            "(function(){"
+            "try{"
+            "var p=window.location.pathname||'/';"
+            "var b=p.endsWith('/')?p.slice(0,-1):p.replace(/\\/[^/]*$/,'');"
+            "if(!b||b==='/'){return;}"
+            "window.__HERMES_API_BASE_PATH__=b;"
+            "var f=window.fetch.bind(window);"
+            "window.fetch=function(i,n){"
+            "try{"
+            "if(typeof i==='string'&&i.indexOf('/api/')===0){i=b+i;}"
+            "else if(i instanceof Request&&typeof i.url==='string'){"
+            "var o=window.location.origin+'/api/';"
+            "if(i.url.indexOf(o)===0){i=new Request(b+i.url.slice(window.location.origin.length),i);}"
+            "}"
+            "}catch(_e){}"
+            "return f(i,n);"
+            "};"
+            "}catch(_e){}"
+            "})();"
+            "</script>"
         )
-        html = html.replace("</head>", f"{token_script}</head>", 1)
+        if "<base " not in html:
+            html = html.replace("</head>", '<base href="./" />' + token_script + "</head>", 1)
+        else:
+            html = html.replace("</head>", f"{token_script}</head>", 1)
         return HTMLResponse(
             html,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -2076,6 +2200,15 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
+        if full_path and "assets/" in full_path:
+            _, _, suffix = full_path.partition("assets/")
+            nested_asset = (WEB_DIST / "assets" / suffix).resolve()
+            if (
+                nested_asset.is_relative_to(WEB_DIST.resolve())
+                and nested_asset.exists()
+                and nested_asset.is_file()
+            ):
+                return FileResponse(nested_asset)
         return _serve_index()
 
 

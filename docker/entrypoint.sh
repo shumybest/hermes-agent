@@ -78,4 +78,84 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+should_start_theviber_dashboard() {
+    case "${THEVIBER_HERMES_DASHBOARD_ENABLED:-}" in
+        1|true|TRUE|yes|YES|on|ON) ;;
+        *) return 1 ;;
+    esac
+    [ "$#" -ge 3 ] || return 1
+    [ "$1" = "gateway" ] || return 1
+    [ "$2" = "run" ] || return 1
+    [ "$3" = "--replace" ] || return 1
+    return 0
+}
+
+if should_start_theviber_dashboard "$@"; then
+    dashboard_host="${THEVIBER_HERMES_DASHBOARD_HOST:-0.0.0.0}"
+    dashboard_port="${THEVIBER_HERMES_DASHBOARD_PORT:-9119}"
+    gateway_restart_exit_code="${THEVIBER_HERMES_GATEWAY_RESTART_EXIT_CODE:-75}"
+    gateway_cmd=("$@")
+    dashboard_args=(dashboard --host "$dashboard_host" --port "$dashboard_port" --no-open)
+    case "$dashboard_host" in
+        127.0.0.1|localhost|::1) ;;
+        *) dashboard_args+=(--insecure) ;;
+    esac
+
+    start_gateway() {
+        hermes "${gateway_cmd[@]}" &
+        gateway_pid=$!
+    }
+
+    hermes "${dashboard_args[@]}" &
+    dashboard_pid=$!
+    start_gateway
+
+    terminate_children() {
+        kill "$gateway_pid" "$dashboard_pid" 2>/dev/null || true
+    }
+
+    forward_gateway_reload_signal() {
+        kill -USR1 "$gateway_pid" 2>/dev/null || true
+    }
+
+    trap terminate_children INT TERM
+    trap forward_gateway_reload_signal USR1
+
+    while true; do
+        set +e
+        wait -n "$gateway_pid" "$dashboard_pid"
+        wait_status=$?
+        set -e
+
+        gateway_alive=1
+        dashboard_alive=1
+        kill -0 "$gateway_pid" 2>/dev/null || gateway_alive=0
+        kill -0 "$dashboard_pid" 2>/dev/null || dashboard_alive=0
+
+        if [ "$gateway_alive" -eq 0 ]; then
+            gateway_exit="$wait_status"
+            if [ "$gateway_exit" -eq "$gateway_restart_exit_code" ] && [ "$dashboard_alive" -eq 1 ]; then
+                start_gateway
+                continue
+            fi
+            terminate_children
+            set +e
+            wait "$gateway_pid" 2>/dev/null || true
+            wait "$dashboard_pid" 2>/dev/null || true
+            set -e
+            exit "$gateway_exit"
+        fi
+
+        if [ "$dashboard_alive" -eq 0 ]; then
+            dashboard_exit="$wait_status"
+            terminate_children
+            set +e
+            wait "$gateway_pid" 2>/dev/null || true
+            wait "$dashboard_pid" 2>/dev/null || true
+            set -e
+            exit "$dashboard_exit"
+        fi
+    done
+fi
+
 exec hermes "$@"

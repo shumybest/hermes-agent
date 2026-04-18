@@ -23,13 +23,26 @@ from hermes_cli.auth import (
     resolve_nous_runtime_credentials,
     resolve_codex_runtime_credentials,
     resolve_qwen_runtime_credentials,
-    resolve_gemini_oauth_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
+
+
+_resolve_gemini_oauth_runtime_credentials = getattr(
+    auth_mod, "resolve_gemini_oauth_runtime_credentials", None
+)
+
+
+def resolve_gemini_oauth_runtime_credentials() -> Dict[str, Any]:
+    """Backwards-compatible wrapper for optional Gemini OAuth support."""
+    if _resolve_gemini_oauth_runtime_credentials is None:
+        raise AuthError(
+            "Google Gemini OAuth runtime credentials are unavailable in this Hermes build."
+        )
+    return _resolve_gemini_oauth_runtime_credentials()
 
 
 def _normalize_custom_provider_name(value: str) -> str:

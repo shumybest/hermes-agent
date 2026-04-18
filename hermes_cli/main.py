@@ -3308,6 +3308,9 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
 
     Returns True if the build succeeded or was skipped (no package.json).
     """
+    web_dist_index = PROJECT_ROOT / "hermes_cli" / "web_dist" / "index.html"
+    if web_dist_index.exists():
+        return True
     if not (web_dir / "package.json").exists():
         return True
     import shutil
