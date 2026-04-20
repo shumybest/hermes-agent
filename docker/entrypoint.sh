@@ -73,6 +73,63 @@ ln -sfn "$HERMES_HOME" "$INSTALL_DIR/runtime-state"
 ln -sfn "$HERMES_HOME/config.yaml" "$INSTALL_DIR/runtime-config.yaml"
 ln -sfn "$HERMES_HOME/.env" "$INSTALL_DIR/runtime.env"
 
+ensure_dir_if_absolute() {
+    local path="$1"
+    case "$path" in
+        /*) mkdir -p "$path" 2>/dev/null || true ;;
+        *) ;;
+    esac
+}
+
+ensure_symlink() {
+    local link_path="$1"
+    local target_path="$2"
+    if [ -L "$link_path" ]; then
+        local current_target
+        current_target="$(readlink "$link_path" 2>/dev/null || true)"
+        if [ "$current_target" = "$target_path" ]; then
+            return 0
+        fi
+        rm -f "$link_path" 2>/dev/null || return 1
+    elif [ -e "$link_path" ]; then
+        return 1
+    fi
+    ln -s "$target_path" "$link_path" 2>/dev/null || return 1
+    return 0
+}
+
+link_workspace_alias() {
+    local alias_name="$1"
+    local target_path="$2"
+    local repo_root="${THEVIBER_WORKSPACE_REPO_ROOT:-}"
+    if [ -z "$alias_name" ] || [ -z "$target_path" ] || [ -z "$repo_root" ]; then
+        return 0
+    fi
+    case "$repo_root" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    case "$target_path" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    ensure_dir_if_absolute "$target_path"
+    if [ ! -d "$repo_root" ]; then
+        return 0
+    fi
+    local primary="${repo_root%/}/${alias_name}"
+    if ensure_symlink "$primary" "$target_path"; then
+        return 0
+    fi
+    local fallback_dir="${repo_root%/}/.theviber"
+    mkdir -p "$fallback_dir" 2>/dev/null || return 0
+    local fallback="${fallback_dir%/}/${alias_name}"
+    ensure_symlink "$fallback" "$target_path" || true
+}
+
+link_workspace_alias "exchange" "${THEVIBER_WORKSPACE_EXCHANGE_ROOT:-}"
+link_workspace_alias "artifacts" "${THEVIBER_WORKSPACE_ARTIFACTS_ROOT:-}"
+
 # Sync bundled skills (manifest-based so user edits are preserved)
 if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
