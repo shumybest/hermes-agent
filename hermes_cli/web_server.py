@@ -2421,6 +2421,7 @@ def start_server(
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
+    embedded_chat: bool = False,
 ):
     """Start the web UI server."""
     import uvicorn
